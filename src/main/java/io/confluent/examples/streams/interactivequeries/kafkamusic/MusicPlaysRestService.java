@@ -47,6 +47,9 @@ import javax.ws.rs.core.MediaType;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.confluent.examples.streams.interactivequeries.kafkamusic.KafkaMusicExample.PLAY_STATS;
+import static io.confluent.examples.streams.interactivequeries.kafkamusic.KafkaMusicExample.SONGS_PLAYED_STORE;
+
 /**
  *  A simple REST proxy that runs embedded in the {@link KafkaMusicExample}. This is used to
  *  demonstrate how a developer can use the Interactive Queries APIs exposed by Kafka Streams to
@@ -203,6 +206,59 @@ public class MusicPlaysRestService {
   @Produces(MediaType.APPLICATION_JSON)
   public List<HostStoreInfo> streamsMetadataForStore(@PathParam("storeName") final String store) {
     return metadataService.streamsMetadataForStore(store);
+  }
+
+  /**
+   * Information about total and per song play count.
+   * @return PLayStatsBeen - Includes song metadata alongside play count.
+   */
+  @GET
+  @Path("/charts/play-stats")
+  @Produces(MediaType.APPLICATION_JSON)
+  public PlayStatsBean playStats() {
+    final ReadOnlyKeyValueStore<Long, Song> songStore = streams.store(KafkaMusicExample.ALL_SONGS,
+            QueryableStoreTypes.keyValueStore());
+
+    // Mappings of song ids to play count.
+    final ReadOnlyKeyValueStore<String, SongStats> playedSongsStore = streams.store(SONGS_PLAYED_STORE,
+            QueryableStoreTypes.keyValueStore());
+
+    final SongStats songStats = playedSongsStore.get(PLAY_STATS);
+
+    if (songStats == null)
+      throw new NotFoundException(String.format("Error getting %s for key %s", SONGS_PLAYED_STORE, PLAY_STATS));
+
+    final List<SongPlayCountBean> results = new ArrayList<>();
+
+    for (final SongPlayCount stats : songStats) {
+      final Song song;
+
+      // Check if song is on host instance
+      final HostStoreInfo
+              host =
+              metadataService.streamsMetadataForStoreAndKey(KafkaMusicExample.ALL_SONGS,
+                      stats.getSongId(), serializer);
+
+      // if the song is not hosted on this instance then we need to lookup it up
+      // on the instance it is on.
+      if (!thisHost(host)) {
+        final SongBean songRes =
+                client.target(String.format("http://%s:%d/kafka-music/song/%d",
+                        host.getHost(),
+                        host.getPort(),
+                        stats.getSongId()))
+                        .request(MediaType.APPLICATION_JSON_TYPE)
+                        .get(SongBean.class);
+        song = new Song(stats.getSongId(), songRes.getAlbum(), songRes.getArtist(), songRes.getName(), null);
+      } else {
+        // Local store
+        song = songStore.get(stats.getSongId());
+      }
+
+      results.add(new SongPlayCountBean(song.getArtist(), song.getAlbum(), song.getName(), stats.getPlays()));
+    }
+
+    return new PlayStatsBean(results);
   }
 
   /**

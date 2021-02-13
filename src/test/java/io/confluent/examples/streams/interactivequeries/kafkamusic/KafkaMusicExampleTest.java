@@ -50,12 +50,7 @@ import javax.ws.rs.core.MediaType;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
@@ -63,6 +58,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static junit.framework.TestCase.assertEquals;
 import static junit.framework.TestCase.fail;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -86,6 +82,10 @@ public class KafkaMusicExampleTest {
   private int appServerPort;
   private static final List<Song> songs = new ArrayList<>();
   private static final Logger log = LoggerFactory.getLogger(KafkaMusicExampleTest.class);
+
+  // Map key here is a hash of song name, album and artist name (getSongHash)
+  // This is because PlayStatsBean songs list does not contain id and will need to be matched via custom hash
+  private static final Map<Integer, Long> songPlayCountMap = new HashMap<>();
 
   @BeforeClass
   public static void createTopicsAndProduceDataToInputTopics() throws Exception {
@@ -144,19 +144,13 @@ public class KafkaMusicExampleTest {
     songProducer.close();
 
     // create the play events we can use for charting
-    sendPlayEvents(6, songs.get(0), playEventProducer);
-    sendPlayEvents(5, songs.get(1), playEventProducer);
-    sendPlayEvents(4, songs.get(2), playEventProducer);
-    sendPlayEvents(3, songs.get(3), playEventProducer);
-    sendPlayEvents(2, songs.get(4), playEventProducer);
-    sendPlayEvents(1, songs.get(5), playEventProducer);
-
-    sendPlayEvents(6, songs.get(6), playEventProducer);
-    sendPlayEvents(5, songs.get(7), playEventProducer);
-    sendPlayEvents(4, songs.get(8), playEventProducer);
-    sendPlayEvents(3, songs.get(9), playEventProducer);
-    sendPlayEvents(2, songs.get(10), playEventProducer);
-    sendPlayEvents(1, songs.get(11), playEventProducer);
+    for (int i = 0; i < 12; i++) {
+      final int playCount = 6 - (i % 6);
+      Song song = songs.get(i);
+      // Add song play count to the map in order to use the map to test song play count
+      songPlayCountMap.put(getSongHash(song.getName(), song.getAlbum(), song.getArtist()), (long) playCount);
+      sendPlayEvents(playCount, song, playEventProducer);
+    }
 
     playEventProducer.close();
   }
@@ -208,6 +202,153 @@ public class KafkaMusicExampleTest {
   @Test
   public void shouldCreateChartsAndAccessThemViaInteractiveQueries() throws Exception {
     final String host = "localhost";
+
+    initStreams(host);
+
+    if (restProxy != null) {
+      // wait until the StreamsMetadata is available as this indicates that
+      // KafkaStreams initialization has occurred
+      TestUtils.waitForCondition(
+        () -> !StreamsMetadata.NOT_AVAILABLE.equals(streams.allMetadataForStore(KafkaMusicExample.TOP_FIVE_SONGS_STORE)),
+        MAX_WAIT_MS,
+        "StreamsMetadata should be available");
+      final String baseUrl = "http://" + host + ":" + appServerPort + "/kafka-music";
+      final Client client = ClientBuilder.newClient();
+
+      waitForSongEvents();
+
+      final IntFunction<SongPlayCountBean> intFunction = index -> {
+        final Song song = songs.get(index);
+        return songCountPlayBean(song, 6L - (index % 6));
+      };
+
+      // Verify that the charts are as expected
+      verifyChart(baseUrl + "/charts/genre/punk",
+                  client,
+                  IntStream.range(0, 5).mapToObj(intFunction).collect(Collectors.toList()));
+
+      verifyChart(baseUrl + "/charts/genre/hip hop",
+                  client,
+                  IntStream.range(6, 11).mapToObj(intFunction).collect(Collectors.toList()));
+
+      verifyChart(baseUrl + "/charts/top-five",
+                  client,
+                  Arrays.asList(songCountPlayBean(songs.get(0), 6L),
+                                songCountPlayBean(songs.get(6), 6L),
+                                songCountPlayBean(songs.get(1), 5L),
+                                songCountPlayBean(songs.get(7), 5L),
+                                songCountPlayBean(songs.get(2), 4L)
+                                )
+                  );
+
+    } else {
+      fail("Should fail demonstrating InteractiveQueries as the Rest Service failed to start.");
+    }
+  }
+
+  @Test
+  public void playEventShouldContainCorrectSongPlayCounts() throws Exception {
+
+    final String host = "localhost";
+    initStreams(host);
+
+    if (restProxy == null)
+      fail("Rest proxy failed to start");
+
+    // wait until the StreamsMetadata is available as this indicates that
+    // KafkaStreams initialization has occurred
+    TestUtils.waitForCondition(
+            () -> !StreamsMetadata.NOT_AVAILABLE.equals(streams.allMetadataForStore(KafkaMusicExample.TOP_FIVE_SONGS_STORE)),
+            MAX_WAIT_MS,
+            "StreamsMetadata should be available");
+    final String baseUrl = "http://" + host + ":" + appServerPort + "/kafka-music";
+    final Client client = ClientBuilder.newClient();
+
+    waitForSongEvents();
+
+    final String url = baseUrl + "/charts/play-stats";
+
+    final Invocation.Builder playStatsRequest = client.target(url).request(MediaType.APPLICATION_JSON_TYPE);
+
+    TestUtils.waitForCondition(() -> {
+      try {
+        final PlayStatsBean playStats = MicroserviceTestUtils.getWithRetries(
+                playStatsRequest,
+                new GenericType<PlayStatsBean>() {
+                },
+                0);
+        System.err.println(playStats.getNumOfSongsPlayed());
+        return playStats.getNumOfSongsPlayed() == songPlayCountMap.size();
+      } catch (final Exception e) {
+        e.printStackTrace();
+        return false;
+      }
+    }, MAX_WAIT_MS, songPlayCountMap.size() + " songs should have been played");
+
+    final PlayStatsBean playStats = MicroserviceTestUtils.getWithRetries(playStatsRequest, new GenericType<PlayStatsBean>() {
+    }, 0);
+
+    playStats.getSongs().forEach(song -> {
+      long actualPlayCount = songPlayCountMap.get(getSongHash(song.getName(), song.getAlbum(), song.getArtist()));
+      assertEquals(song.getPlays().longValue(), actualPlayCount);
+    });
+  }
+
+  @Test
+  public void playStatsShouldContainCorrectNumOfPlays() throws Exception {
+    final String host = "localhost";
+    initStreams(host);
+
+    if (restProxy == null)
+      fail("Rest proxy failed to start");
+
+    // wait until the StreamsMetadata is available as this indicates that
+    // KafkaStreams initialization has occurred
+    TestUtils.waitForCondition(
+            () -> !StreamsMetadata.NOT_AVAILABLE.equals(streams.allMetadataForStore(KafkaMusicExample.TOP_FIVE_SONGS_STORE)),
+            MAX_WAIT_MS,
+            "StreamsMetadata should be available");
+    final String baseUrl = "http://" + host + ":" + appServerPort + "/kafka-music";
+    final Client client = ClientBuilder.newClient();
+
+    waitForSongEvents();
+
+    final String url = baseUrl + "/charts/play-stats";
+
+    final Invocation.Builder playStatsRequest = client.target(url).request(MediaType.APPLICATION_JSON_TYPE);
+
+    TestUtils.waitForCondition(() -> {
+      try {
+        final PlayStatsBean playStats = MicroserviceTestUtils.getWithRetries(
+                playStatsRequest,
+                new GenericType<PlayStatsBean>() {
+                },
+                0);
+        System.err.println(playStats.getNumOfSongsPlayed());
+        return playStats.getNumOfSongsPlayed() == songPlayCountMap.size();
+      } catch (final Exception e) {
+        e.printStackTrace();
+        return false;
+      }
+    }, MAX_WAIT_MS, songs.size() + " songs should have been played");
+
+    final PlayStatsBean playStats = MicroserviceTestUtils.getWithRetries(playStatsRequest, new GenericType<PlayStatsBean>() {
+    }, 0);
+
+    assertEquals(playStats.getTotalPlays(), 42);
+  }
+
+  private static int getSongHash(String name, String album, String artist) {
+    return Objects.hash(name, album, artist);
+  }
+
+  /**
+   * Initialize stream
+   * @param host Address of kafka server
+   * @throws InterruptedException Startup is interrupted
+   * @throws RuntimeException Streams don't finish rebalancing on startup
+   */
+  private void initStreams(final String host) throws Exception {
     createStreams(host);
     final CountDownLatch startupLatch = new CountDownLatch(1);
     streams.setStateListener((newState, oldState) -> {
@@ -224,56 +365,23 @@ public class KafkaMusicExampleTest {
     } catch (final InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+  }
 
-    if (restProxy != null) {
-      // wait until the StreamsMetadata is available as this indicates that
-      // KafkaStreams initialization has occurred
-      TestUtils.waitForCondition(
-        () -> !StreamsMetadata.NOT_AVAILABLE.equals(streams.allMetadataForStore(KafkaMusicExample.TOP_FIVE_SONGS_STORE)),
-        MAX_WAIT_MS,
-        "StreamsMetadata should be available");
-      final String baseUrl = "http://" + host + ":" + appServerPort + "/kafka-music";
-      final Client client = ClientBuilder.newClient();
-  
-      // Wait until the all-songs state store has some data in it
-      TestUtils.waitForCondition(() -> {
-        final ReadOnlyKeyValueStore<Long, Song> songsStore;
-        try {
-          songsStore = streams.store(KafkaMusicExample.ALL_SONGS, QueryableStoreTypes.keyValueStore());
-          return songsStore.all().hasNext();
-        } catch (final Exception e) {
-          e.printStackTrace();
-          return false;
-        }
-      }, MAX_WAIT_MS, KafkaMusicExample.ALL_SONGS + " should be non-empty");
-  
-      final IntFunction<SongPlayCountBean> intFunction = index -> {
-        final Song song = songs.get(index);
-        return songCountPlayBean(song, 6L - (index % 6));
-      };
-  
-      // Verify that the charts are as expected
-      verifyChart(baseUrl + "/charts/genre/punk",
-                  client,
-                  IntStream.range(0, 5).mapToObj(intFunction).collect(Collectors.toList()));
-  
-      verifyChart(baseUrl + "/charts/genre/hip hop",
-                  client,
-                  IntStream.range(6, 11).mapToObj(intFunction).collect(Collectors.toList()));
-  
-      verifyChart(baseUrl + "/charts/top-five",
-                  client,
-                  Arrays.asList(songCountPlayBean(songs.get(0), 6L),
-                                songCountPlayBean(songs.get(6), 6L),
-                                songCountPlayBean(songs.get(1), 5L),
-                                songCountPlayBean(songs.get(7), 5L),
-                                songCountPlayBean(songs.get(2), 4L)
-                                )
-                  );
-  
-    } else {
-      fail("Should fail demonstrating InteractiveQueries as the Rest Service failed to start.");
-    }
+  /**
+   * Wait until the all-songs state store has some data in it
+   * @throws InterruptedException
+   */
+  private void waitForSongEvents() throws InterruptedException {
+    TestUtils.waitForCondition(() -> {
+      final ReadOnlyKeyValueStore<Long, Song> songsStore;
+      try {
+        songsStore = streams.store(KafkaMusicExample.ALL_SONGS, QueryableStoreTypes.keyValueStore());
+        return songsStore.all().hasNext();
+      } catch (final Exception e) {
+        e.printStackTrace();
+        return false;
+      }
+    }, MAX_WAIT_MS, KafkaMusicExample.ALL_SONGS + " should be non-empty");
   }
 
   private SongPlayCountBean songCountPlayBean(final Song song, final long plays) {

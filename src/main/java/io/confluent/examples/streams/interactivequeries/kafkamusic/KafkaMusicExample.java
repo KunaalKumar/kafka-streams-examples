@@ -170,10 +170,12 @@ import static java.util.Collections.singletonMap;
 public class KafkaMusicExample {
 
   private static final Long MIN_CHARTABLE_DURATION = 30 * 1000L;
-  private static final String SONG_PLAY_COUNT_STORE = "song-play-count";
+  static final String SONG_PLAY_COUNT_STORE = "song-play-count";
   static final String PLAY_EVENTS = "play-events";
   static final String ALL_SONGS = "all-songs";
   static final String SONG_FEED = "song-feed";
+  static final String PLAY_STATS = "play-stats";
+  static final String SONGS_PLAYED_STORE = "songs-played";
   static final String TOP_FIVE_SONGS_BY_GENRE_STORE = "top-five-songs-by-genre";
   static final String TOP_FIVE_SONGS_STORE = "top-five-songs";
   static final String TOP_FIVE_KEY = "all";
@@ -376,6 +378,28 @@ public class KafkaMusicExample {
                 .withKeySerde(Serdes.String())
                 .withValueSerde(topFiveSerde)
         );
+
+    final SongStats.SongStatsSerde songStatsSerde = new SongStats.SongStatsSerde();
+
+    // Map play counts to song ids and aggregate it into SongStats
+    // Song id will be used to map the song to the play count via the REST API (`playStats()`)
+    songPlayCounts.groupBy((song, plays) ->
+                    KeyValue.pair(PLAY_STATS,
+                            new SongPlayCount(song.getId(), plays)),
+            Grouped.with(Serdes.String(), songPlayCountSerde))
+            .aggregate(SongStats::new,
+                    (aggKey, value, aggregate) -> {
+                      aggregate.add(value);
+                      return aggregate;
+                    },
+                    (aggKey, value, aggregate) -> {
+                      aggregate.remove(value);
+                      return aggregate;
+                    },
+                    Materialized.<String, SongStats, KeyValueStore<Bytes, byte[]>>as(SONGS_PLAYED_STORE)
+                            .withKeySerde(Serdes.String())
+                            .withValueSerde(songStatsSerde)
+            );
 
     return builder.build();
   }
