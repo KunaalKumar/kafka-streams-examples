@@ -170,7 +170,7 @@ import static java.util.Collections.singletonMap;
 public class KafkaMusicExample {
 
   private static final Long MIN_CHARTABLE_DURATION = 30 * 1000L;
-  static final String SONG_PLAY_COUNT_STORE = "song-play-count";
+  private static final String SONG_PLAY_COUNT_STORE = "song-play-count";
   static final String PLAY_EVENTS = "play-events";
   static final String ALL_SONGS = "all-songs";
   static final String SONG_FEED = "song-feed";
